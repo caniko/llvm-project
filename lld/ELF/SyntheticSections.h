@@ -1019,12 +1019,16 @@ private:
 template <class ELFT> class BtfSection final : public SyntheticSection {
 public:
   BtfSection(Ctx &);
+  void finalizeContents() override;
   void writeTo(uint8_t *buf) override;
   size_t getSize() const override { return outputData.size(); }
-  bool isNeeded() const override { return !outputData.empty(); }
+  bool isNeeded() const override { return hasInputs; }
 
 private:
+  SmallVector<InputSection *, 0> inputs;
   SmallVector<uint8_t, 0> outputData;
+  bool hasInputs = false;
+  bool finalized = false;
 };
 
 // For more information about .gnu.version and .gnu.version_r see:

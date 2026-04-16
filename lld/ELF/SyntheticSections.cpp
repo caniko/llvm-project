@@ -3681,26 +3681,106 @@ bool GdbIndexSection::isNeeded() const { return !chunks.empty(); }
 template <class ELFT>
 BtfSection<ELFT>::BtfSection(Ctx &ctx)
     : SyntheticSection(ctx, ".BTF", SHT_PROGBITS, 0, 1) {
-  llvm::TimeTraceScope timeScope("Merge BTF");
-  const bool isLE = ELFT::Endianness == llvm::endianness::little;
-  llvm::BTFBuilder builder;
-
-  // Collect all .BTF input sections and merge them.
-  // Mark originals dead so they don't appear in the output.
-  // Also discard .BTF.ext sections: they reference per-object type IDs
-  // that are invalidated by the merge and dedup.
   for (InputSectionBase *s : ctx.inputSections) {
     if (!s->isLive())
       continue;
-    if (s->name == ".BTF.ext") {
-      s->markDead();
-      continue;
-    }
     if (s->name != ".BTF")
       continue;
+
+    auto *isec = dyn_cast<InputSection>(s);
+    if (!isec)
+      continue;
+
+    inputs.push_back(isec);
+    hasInputs = true;
     s->markDead();
+    if (s->file->kind() == InputFile::ObjKind && s->relSecIdx != 0)
+      if (InputSectionBase *rel = s->file->getSections()[s->relSecIdx])
+        rel->markDead();
+  }
+}
+
+template <class ELFT, class RelTy>
+static bool applyBtfRelocations(InputSection &sec, MutableArrayRef<uint8_t> buf,
+                                Relocs<RelTy> rels) {
+  const unsigned bits = sizeof(typename ELFT::uint) * 8;
+  Ctx &ctx = sec.getCtx();
+  const TargetInfo &target = *ctx.target;
+
+  for (const RelTy &rel : rels) {
+    const RelType type = rel.getType(ctx.arg.isMips64EL);
+    const uint64_t offset = rel.r_offset;
+    if (offset >= buf.size()) {
+      Err(ctx) << &sec << ": relocation offset " << offset
+               << " is outside the .BTF section";
+      return false;
+    }
+
+    uint8_t *bufLoc = buf.data() + offset;
+    int64_t addend = getAddend<ELFT>(rel);
+    if (!RelTy::HasAddend)
+      addend += target.getImplicitAddend(bufLoc, type);
+
+    Symbol &sym = sec.file->getRelocTargetSym(rel);
+    RelExpr expr = target.getRelExpr(type, sym, bufLoc);
+    if (expr == R_NONE)
+      continue;
+
+    if (expr == R_ABS) {
+      target.relocateNoSym(bufLoc, type,
+                           SignExtend64<bits>(sym.getVA(ctx, addend)));
+      continue;
+    }
+
+    if (expr == R_SIZE) {
+      target.relocateNoSym(bufLoc, type,
+                           SignExtend64<bits>(sym.getSize() + addend));
+      continue;
+    }
+
+    Err(ctx) << &sec << ": unsupported .BTF relocation " << type
+             << " against '" << &sym << "'";
+    return false;
+  }
+
+  return true;
+}
+
+template <class ELFT>
+static bool applyBtfRelocations(InputSection &sec,
+                                SmallVectorImpl<uint8_t> &buf) {
+  if (!sec.relSecIdx)
+    return true;
+
+  const RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  MutableArrayRef<uint8_t> data(buf.data(), buf.size());
+  if (rels.areRelocsCrel())
+    return applyBtfRelocations<ELFT>(sec, data, rels.crels);
+  if (rels.areRelocsRel())
+    return applyBtfRelocations<ELFT>(sec, data, rels.rels);
+  return applyBtfRelocations<ELFT>(sec, data, rels.relas);
+}
+
+template <class ELFT> void BtfSection<ELFT>::finalizeContents() {
+  if (!hasInputs)
+    return;
+
+  llvm::TimeTraceScope timeScope("Merge BTF");
+  finalized = true;
+  outputData.clear();
+
+  const bool isLE = ELFT::Endianness == llvm::endianness::little;
+  llvm::BTFBuilder builder;
+
+  for (InputSection *s : inputs) {
+    SmallVector<uint8_t, 0> relocated;
     ArrayRef<uint8_t> data = s->content();
-    StringRef raw(reinterpret_cast<const char *>(data.data()), data.size());
+    relocated.append(data.begin(), data.end());
+    if (!applyBtfRelocations<ELFT>(*s, relocated))
+      return;
+
+    StringRef raw(reinterpret_cast<const char *>(relocated.data()),
+                  relocated.size());
     Expected<uint32_t> idBase = builder.merge(raw, isLE);
     if (!idBase) {
       Warn(ctx) << s << ": failed to parse .BTF section: "

@@ -967,6 +967,52 @@ TEST(BTFDedupTest, allKindsDedup) {
   }
 }
 
+TEST(BTFDedupTest, dataSecDedupChecksVarSecInfo) {
+  BTFBuilder B;
+
+  uint32_t IntS = B.addString("int");
+  uint32_t DataS = B.addString(".data");
+  uint32_t AS = B.addString("a");
+  uint32_t IntS2 = B.addString("int");
+  uint32_t DataS2 = B.addString(".data");
+  uint32_t BS = B.addString("b");
+
+  B.addType({IntS, mkInfo(BTF::BTF_KIND_INT), {4}}); // 1
+  B.addTail((uint32_t)0);
+  B.addType({AS, mkInfo(BTF::BTF_KIND_VAR), {1}}); // 2
+  B.addTail((uint32_t)0);
+  B.addType({DataS, mkInfo(BTF::BTF_KIND_DATASEC) | 1, {4}}); // 3
+  B.addTail(BTF::BTFDataSec({2, 0, 4}));
+
+  B.addType({IntS2, mkInfo(BTF::BTF_KIND_INT), {4}}); // 4 (dup of 1)
+  B.addTail((uint32_t)0);
+  B.addType({BS, mkInfo(BTF::BTF_KIND_VAR), {4}}); // 5
+  B.addTail((uint32_t)0);
+  B.addType({DataS2, mkInfo(BTF::BTF_KIND_DATASEC) | 1, {4}}); // 6
+  B.addTail(BTF::BTFDataSec({5, 4, 4}));
+
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 5u);
+
+  const BTF::CommonType *First = B.findType(3);
+  ASSERT_TRUE(First);
+  EXPECT_EQ(First->getKind(), BTF::BTF_KIND_DATASEC);
+  auto *FirstVar = reinterpret_cast<const BTF::BTFDataSec *>(
+      reinterpret_cast<const uint8_t *>(First) + sizeof(BTF::CommonType));
+  EXPECT_EQ(FirstVar[0].Type, 2u);
+  EXPECT_EQ(FirstVar[0].Offset, 0u);
+  EXPECT_EQ(FirstVar[0].Size, 4u);
+
+  const BTF::CommonType *Second = B.findType(5);
+  ASSERT_TRUE(Second);
+  EXPECT_EQ(Second->getKind(), BTF::BTF_KIND_DATASEC);
+  auto *SecondVar = reinterpret_cast<const BTF::BTFDataSec *>(
+      reinterpret_cast<const uint8_t *>(Second) + sizeof(BTF::CommonType));
+  EXPECT_EQ(SecondVar[0].Type, 4u);
+  EXPECT_EQ(SecondVar[0].Offset, 4u);
+  EXPECT_EQ(SecondVar[0].Size, 4u);
+}
+
 TEST(BTFDedupTest, unionDedup) {
   BTFBuilder B;
   uint32_t IntS = B.addString("int");

@@ -2099,6 +2099,7 @@ template <class ELFT> void Writer<ELFT>::finalizeSections() {
   {
     llvm::TimeTraceScope timeScope("Finalize synthetic sections");
 
+    finalizeSynthetic(ctx, ctx.in.btfSection.get());
     finalizeSynthetic(ctx, ctx.in.bss.get());
     finalizeSynthetic(ctx, ctx.in.bssRelRo.get());
     finalizeSynthetic(ctx, ctx.in.symTabShndx.get());
@@ -2166,6 +2167,7 @@ template <class ELFT> void Writer<ELFT>::finalizeSections() {
     llvm::TimeTraceScope timeScope("Finalize synthetic sections");
     // finalizeAddressDependentContent may have added local symbols to the
     // static symbol table.
+    finalizeSynthetic(ctx, ctx.in.btfSection.get());
     finalizeSynthetic(ctx, ctx.in.symTab.get());
     finalizeSynthetic(ctx, ctx.in.debugNames.get());
     finalizeSynthetic(ctx, ctx.in.ppc64LongBranchTarget.get());

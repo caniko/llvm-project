@@ -42,17 +42,17 @@
 # RUN: ld.lld --btf-merge --gc-sections a.o b.o -o gc
 # RUN: llvm-readelf -x .BTF gc | FileCheck %s --check-prefix=BTF-HEX
 
-## .BTF.ext sections are discarded when --btf-merge is active because
-## their type ID references are invalidated by the merge and dedup.
+## .BTF.ext stays on the regular linker path when --btf-merge is active.
+## This object also has .rela.BTF.ext relocations, which used to trigger
+## orphan-section handling bugs when .BTF merge discarded only the payload.
 # RUN: llvm-mc -filetype=obj -triple=x86_64 btfext.s -o btfext.o
 # RUN: ld.lld --btf-merge a.o btfext.o -o btfext
-# RUN: llvm-readelf -S btfext | FileCheck %s --check-prefix=NO-BTFEXT
+# RUN: llvm-readelf -S btfext | FileCheck %s --check-prefix=HAS-BTFEXT
 
 ## Without --btf-merge, .BTF.ext passes through.
 # RUN: ld.lld a.o btfext.o -o btfext-pass
 # RUN: llvm-readelf -S btfext-pass | FileCheck %s --check-prefix=HAS-BTFEXT
 
-# NO-BTFEXT-NOT: .BTF.ext
 # HAS-BTFEXT:    .BTF.ext
 
 ## isLive: a .BTF section in a discarded COMDAT group should be skipped.
@@ -183,7 +183,7 @@ btfext_fn:
 .byte 0
 
 .section .BTF.ext,"",@progbits
-## Minimal .BTF.ext header (just enough to be a valid section).
+## Minimal .BTF.ext payload plus one relocation that should survive the link.
 .short 0xeb9f           # magic
 .byte 1                 # version
 .byte 0                 # flags
@@ -192,6 +192,7 @@ btfext_fn:
 .long 0                 # func_info_len
 .long 0                 # line_info_off
 .long 0                 # line_info_len
+.long btfext_fn
 
 #--- comdat1.s
 ## COMDAT group "grp" with a .BTF section containing INT "int".
