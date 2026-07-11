@@ -265,11 +265,132 @@ TEST(BTFDedupTest, fwdDeclResolution) {
   uint32_t FooS2 = B.addString("foo");
   B.addType({FooS2, mkInfo(BTF::BTF_KIND_STRUCT), {0}});
 
-  // FWD and STRUCT are different kinds, so they shouldn't be deduped
-  // by the basic algorithm (FWD resolution is a separate concern).
-  // Both should survive dedup.
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 1u);
+  EXPECT_EQ(B.findType(1)->getKind(), BTF::BTF_KIND_STRUCT);
+}
+
+TEST(BTFDedupTest, fwdResolutionHappensBeforeRefDedup) {
+  BTFBuilder B;
+  uint32_t FooS = B.addString("foo");
+
+  // Type 1: forward declaration of struct foo
+  B.addType({FooS, mkInfo(BTF::BTF_KIND_FWD), {0}});
+  // Type 2: struct foo {}
+  uint32_t FooS2 = B.addString("foo");
+  B.addType({FooS2, mkInfo(BTF::BTF_KIND_STRUCT), {0}});
+  // Type 3: ptr to FWD foo
+  B.addType({0, mkInfo(BTF::BTF_KIND_PTR), {1}});
+  // Type 4: ptr to full struct foo
+  B.addType({0, mkInfo(BTF::BTF_KIND_PTR), {2}});
+
   ASSERT_SUCCEEDED(BTF::dedup(B));
   EXPECT_EQ(B.typesCount(), 2u);
+
+  EXPECT_EQ(B.findType(1)->getKind(), BTF::BTF_KIND_STRUCT);
+  EXPECT_EQ(B.findType(2)->getKind(), BTF::BTF_KIND_PTR);
+  EXPECT_EQ(B.findType(2)->Type, 1u);
+}
+
+TEST(BTFDedupTest, ambiguousFwdResolutionIsPreserved) {
+  BTFBuilder B;
+  uint32_t FooFwdS = B.addString("foo");
+  uint32_t FooStructS = B.addString("foo");
+  uint32_t FooStructS2 = B.addString("foo");
+  uint32_t IntS = B.addString("int");
+  uint32_t LongS = B.addString("long");
+  uint32_t FieldS = B.addString("v");
+
+  // Type 1: forward declaration of struct foo
+  B.addType({FooFwdS, mkInfo(BTF::BTF_KIND_FWD), {0}});
+  // Type 2: int
+  B.addType({IntS, mkInfo(BTF::BTF_KIND_INT), {4}});
+  B.addTail((uint32_t)0);
+  // Type 3: long
+  B.addType({LongS, mkInfo(BTF::BTF_KIND_INT), {8}});
+  B.addTail((uint32_t)0);
+  // Type 4: struct foo { int v; }
+  B.addType({FooStructS, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {4}});
+  B.addTail(BTF::BTFMember({FieldS, 2, 0}));
+  // Type 5: incompatible struct foo { long v; }
+  B.addType({FooStructS2, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {8}});
+  B.addTail(BTF::BTFMember({FieldS, 3, 0}));
+
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 5u);
+  EXPECT_EQ(B.findType(1)->getKind(), BTF::BTF_KIND_FWD);
+}
+
+TEST(BTFDedupTest, compositeDedupWithFwdCompatibleFields) {
+  BTFBuilder B;
+  uint32_t FooFwdS = B.addString("foo");
+  uint32_t HolderS = B.addString("holder");
+  uint32_t PtrMemberS = B.addString("p");
+  uint32_t IntS = B.addString("int");
+  uint32_t FooStructS = B.addString("foo");
+  uint32_t FooFieldS = B.addString("v");
+
+  // Compilation unit 1 only sees a forward declaration when building holder.
+  B.addType({FooFwdS, mkInfo(BTF::BTF_KIND_FWD), {0}});           // 1
+  B.addType({0, mkInfo(BTF::BTF_KIND_PTR), {1}});                 // 2
+  B.addType({HolderS, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {8}});    // 3
+  B.addTail(BTF::BTFMember({PtrMemberS, 2, 0}));
+  B.addType({IntS, mkInfo(BTF::BTF_KIND_INT), {4}});              // 4
+  B.addTail((uint32_t)0);
+  B.addType({FooStructS, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {4}}); // 5
+  B.addTail(BTF::BTFMember({FooFieldS, 4, 0}));
+
+  // Compilation unit 2 has the full foo definition before holder.
+  uint32_t IntS2 = B.addString("int");
+  B.addType({IntS2, mkInfo(BTF::BTF_KIND_INT), {4}});               // 6
+  B.addTail((uint32_t)0);
+  uint32_t FooStructS2 = B.addString("foo");
+  uint32_t FooFieldS2 = B.addString("v");
+  B.addType({FooStructS2, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {4}});  // 7
+  B.addTail(BTF::BTFMember({FooFieldS2, 6, 0}));
+  B.addType({0, mkInfo(BTF::BTF_KIND_PTR), {7}});                   // 8
+  uint32_t HolderS2 = B.addString("holder");
+  uint32_t PtrMemberS2 = B.addString("p");
+  B.addType({HolderS2, mkInfo(BTF::BTF_KIND_STRUCT) | 1, {8}});     // 9
+  B.addTail(BTF::BTFMember({PtrMemberS2, 8, 0}));
+
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 4u);
+
+  uint32_t HolderId = 0;
+  uint32_t HolderCount = 0;
+  uint32_t FooStructCount = 0;
+  uint32_t PtrCount = 0;
+  for (uint32_t Id = 1; Id <= B.typesCount(); ++Id) {
+    const BTF::CommonType *T = B.findType(Id);
+    ASSERT_TRUE(T);
+    if (T->getKind() == BTF::BTF_KIND_PTR)
+      ++PtrCount;
+    if (T->getKind() == BTF::BTF_KIND_STRUCT &&
+        B.findString(T->NameOff) == "foo")
+      ++FooStructCount;
+    if (T->getKind() == BTF::BTF_KIND_STRUCT &&
+        B.findString(T->NameOff) == "holder") {
+      HolderId = Id;
+      ++HolderCount;
+    }
+  }
+
+  EXPECT_EQ(FooStructCount, 1u);
+  EXPECT_EQ(HolderCount, 1u);
+  EXPECT_EQ(PtrCount, 1u);
+
+  const BTF::CommonType *Holder = B.findType(HolderId);
+  ASSERT_TRUE(Holder);
+  auto *Members = reinterpret_cast<const BTF::BTFMember *>(
+      reinterpret_cast<const uint8_t *>(Holder) + sizeof(BTF::CommonType));
+  const BTF::CommonType *PtrTy = B.findType(Members[0].Type);
+  ASSERT_TRUE(PtrTy);
+  EXPECT_EQ(PtrTy->getKind(), BTF::BTF_KIND_PTR);
+  const BTF::CommonType *FooTy = B.findType(PtrTy->Type);
+  ASSERT_TRUE(FooTy);
+  EXPECT_EQ(FooTy->getKind(), BTF::BTF_KIND_STRUCT);
+  EXPECT_EQ(B.findString(FooTy->NameOff), "foo");
 }
 
 TEST(BTFDedupTest, funcProtoDedup) {
@@ -699,6 +820,73 @@ TEST(BTFDedupTest, differentDeclTagComponentIdx) {
 
   ASSERT_SUCCEEDED(BTF::dedup(B));
   EXPECT_EQ(B.typesCount(), 3u);
+}
+
+TEST(BTFDedupTest, duplicateDeclTagOnDuplicateFunction) {
+  BTFBuilder B;
+  uint32_t IntS = B.addString("int");
+  uint32_t FnS = B.addString("foo");
+  uint32_t TagS = B.addString("bpf_kfunc");
+
+  // Type 1: int
+  B.addType({IntS, mkInfo(BTF::BTF_KIND_INT), {4}});
+  B.addTail((uint32_t)0);
+  // Type 2: func proto -> int
+  B.addType({0, mkInfo(BTF::BTF_KIND_FUNC_PROTO), {1}});
+  // Type 3: func foo -> type 2
+  B.addType({FnS, mkInfo(BTF::BTF_KIND_FUNC), {2}});
+  // Type 4: DECL_TAG "bpf_kfunc" on function foo
+  B.addType({TagS, mkInfo(BTF::BTF_KIND_DECL_TAG), {3}});
+  B.addTail((uint32_t)-1);
+
+  uint32_t IntS2 = B.addString("int");
+  uint32_t FnS2 = B.addString("foo");
+  uint32_t TagS2 = B.addString("bpf_kfunc");
+
+  // Types 5-8: duplicate chain.
+  B.addType({IntS2, mkInfo(BTF::BTF_KIND_INT), {4}});
+  B.addTail((uint32_t)0);
+  B.addType({0, mkInfo(BTF::BTF_KIND_FUNC_PROTO), {5}});
+  B.addType({FnS2, mkInfo(BTF::BTF_KIND_FUNC), {6}});
+  B.addType({TagS2, mkInfo(BTF::BTF_KIND_DECL_TAG), {7}});
+  B.addTail((uint32_t)-1);
+
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 4u);
+
+  EXPECT_EQ(B.findType(1)->getKind(), BTF::BTF_KIND_INT);
+  EXPECT_EQ(B.findType(2)->getKind(), BTF::BTF_KIND_FUNC_PROTO);
+  EXPECT_EQ(B.findType(3)->getKind(), BTF::BTF_KIND_FUNC);
+  EXPECT_EQ(B.findType(4)->getKind(), BTF::BTF_KIND_DECL_TAG);
+  EXPECT_EQ(B.findType(3)->Type, 2u);
+  EXPECT_EQ(B.findType(4)->Type, 3u);
+}
+
+TEST(BTFDedupTest, differentDeclTagTargetFunctionsArePreserved) {
+  BTFBuilder B;
+  uint32_t IntS = B.addString("int");
+  uint32_t FooS = B.addString("foo");
+  uint32_t BarS = B.addString("bar");
+  uint32_t TagS = B.addString("bpf_kfunc");
+
+  // int
+  B.addType({IntS, mkInfo(BTF::BTF_KIND_INT), {4}}); // 1
+  B.addTail((uint32_t)0);
+
+  // foo() -> int with a decl tag.
+  B.addType({0, mkInfo(BTF::BTF_KIND_FUNC_PROTO), {1}});      // 2
+  B.addType({FooS, mkInfo(BTF::BTF_KIND_FUNC), {2}});         // 3
+  B.addType({TagS, mkInfo(BTF::BTF_KIND_DECL_TAG), {3}});     // 4
+  B.addTail((uint32_t)-1);
+
+  // bar() -> int with the same decl tag text. This must remain distinct.
+  B.addType({0, mkInfo(BTF::BTF_KIND_FUNC_PROTO), {1}});      // 5
+  B.addType({BarS, mkInfo(BTF::BTF_KIND_FUNC), {5}});         // 6
+  B.addType({TagS, mkInfo(BTF::BTF_KIND_DECL_TAG), {6}});     // 7
+  B.addTail((uint32_t)-1);
+
+  ASSERT_SUCCEEDED(BTF::dedup(B));
+  EXPECT_EQ(B.typesCount(), 6u);
 }
 
 TEST(BTFDedupTest, structDifferentMemberOffsets) {

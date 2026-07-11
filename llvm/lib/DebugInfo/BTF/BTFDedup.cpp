@@ -9,12 +9,13 @@
 // Implements the BTF type deduplication algorithm, a port of the algorithm
 // from libbpf (btf_dedup.c, BSD-licensed).
 //
-// The algorithm runs in 5 passes:
+// The algorithm runs in 6 passes:
 //   1. String deduplication
-//   2. Primitive and composite type dedup (INT, ENUM, STRUCT, UNION, FWD)
-//   3. Reference type dedup (PTR, TYPEDEF, VOLATILE, etc.)
-//   4. Type compaction (remove dups, assign sequential IDs)
-//   5. Type ID remapping (fix all references to use new IDs)
+//   2. Primitive type dedup (INT, FLOAT, ENUM, ENUM64, FWD)
+//   3. Composite type dedup (STRUCT, UNION)
+//   4. Resolve unambiguous FWD -> STRUCT/UNION mappings
+//   5. Reference type dedup (PTR, TYPEDEF, VOLATILE, etc.)
+//   6. Type compaction and ID remapping
 //
 // For struct/union types, a DFS-based type graph equivalence check is used
 // with a "hypothetical map" to handle recursive/cyclic types.
@@ -42,6 +43,12 @@ constexpr uint32_t BTF_UNPROCESSED = UINT32_MAX;
 /// State for the BTF deduplication algorithm.
 class BTFDedupState {
   BTFBuilder &Builder;
+
+  enum class RefDedupState : uint8_t {
+    Unprocessed,
+    InProgress,
+    Done,
+  };
 
   // Equivalence map: Map[i] = canonical type ID for type i.
   // Initially Map[i] = i (each type is its own canonical).
@@ -71,6 +78,14 @@ class BTFDedupState {
   // After compaction: OldToNew[old_id] = new_id.
   std::vector<uint32_t> OldToNew;
 
+  // Reference-type dedup status used by the recursive ref pass.
+  std::vector<RefDedupState> RefState;
+
+  // FWD -> STRUCT/UNION mappings discovered while proving type graph
+  // equivalence. These are committed only if the full top-level comparison
+  // succeeds.
+  SmallVector<std::pair<uint32_t, uint32_t>, 0> PendingFwdResolutions;
+
   static bool isPrimitiveKind(uint32_t Kind) {
     switch (Kind) {
     case BTF::BTF_KIND_INT:
@@ -87,6 +102,19 @@ class BTFDedupState {
   // Returns true if this is a composite kind that needs DFS comparison.
   static bool isCompositeKind(uint32_t Kind) {
     return Kind == BTF::BTF_KIND_STRUCT || Kind == BTF::BTF_KIND_UNION;
+  }
+
+  bool isFwdCompatibleWithComposite(const BTF::CommonType *Fwd,
+                                    const BTF::CommonType *Composite) const {
+    if (!Fwd || !Composite || Fwd->getKind() != BTF::BTF_KIND_FWD ||
+        !isCompositeKind(Composite->getKind()))
+      return false;
+
+    uint32_t FwdKind =
+        (Fwd->Info & BTF::FWD_UNION_FLAG) ? BTF::BTF_KIND_UNION
+                                          : BTF::BTF_KIND_STRUCT;
+    return FwdKind == Composite->getKind() &&
+           dedupStrOff(Fwd->NameOff) == dedupStrOff(Composite->NameOff);
   }
 
   // Get the canonical representative for a type ID.
@@ -108,6 +136,7 @@ class BTFDedupState {
   uint64_t hashFuncProto(const BTF::CommonType *T);
   uint64_t hashArray(const BTF::CommonType *T);
   uint64_t hashDataSec(const BTF::CommonType *T);
+  uint64_t hashDeclTag(uint32_t Id);
 
   // Check if two types are structurally equivalent.
   // Uses the hypothetical map for cycle handling.
@@ -127,6 +156,7 @@ class BTFDedupState {
     for (uint32_t Id : HypotList)
       HypotMap[Id] = BTF_UNPROCESSED;
     HypotList.clear();
+    PendingFwdResolutions.clear();
   }
 
   uint32_t dedupStrOff(uint32_t Offset) const {
@@ -134,12 +164,14 @@ class BTFDedupState {
     return It != NewStrOff.end() ? It->second : Offset;
   }
 
-  // The five passes.
+  // The six passes.
   Error dedupStrings();
   Error dedupPrimitives();
   Error dedupComposites();
+  Error resolveFwds();
   Error dedupRefs();
   Error compact();
+  Expected<uint32_t> dedupRefType(uint32_t Id);
 
 public:
   BTFDedupState(BTFBuilder &B) : Builder(B) {}
@@ -186,19 +218,19 @@ uint64_t BTFDedupState::hashEnum64(const BTF::CommonType *T) {
 }
 
 uint64_t BTFDedupState::hashFuncProto(const BTF::CommonType *T) {
-  // Hash return type + param names (NOT param types).
-  uint64_t H = hash_combine(T->getKind(), T->getVlen());
+  uint64_t H = hash_combine(T->getKind(), T->Type, T->getVlen());
   auto *Params = reinterpret_cast<const BTF::BTFParam *>(
       reinterpret_cast<const uint8_t *>(T) + sizeof(BTF::CommonType));
   for (unsigned I = 0, N = T->getVlen(); I < N; ++I)
-    H = hash_combine(H, dedupStrOff(Params[I].NameOff));
+    H = hash_combine(H, dedupStrOff(Params[I].NameOff), Params[I].Type);
   return H;
 }
 
 uint64_t BTFDedupState::hashArray(const BTF::CommonType *T) {
   auto *Arr = reinterpret_cast<const BTF::BTFArray *>(
       reinterpret_cast<const uint8_t *>(T) + sizeof(BTF::CommonType));
-  return hash_combine(T->getKind(), Arr->Nelems);
+  return hash_combine(T->getKind(), Arr->ElemType, Arr->IndexType,
+                      Arr->Nelems);
 }
 
 uint64_t BTFDedupState::hashDataSec(const BTF::CommonType *T) {
@@ -207,8 +239,22 @@ uint64_t BTFDedupState::hashDataSec(const BTF::CommonType *T) {
   auto *Vars = reinterpret_cast<const BTF::BTFDataSec *>(
       reinterpret_cast<const uint8_t *>(T) + sizeof(BTF::CommonType));
   for (unsigned I = 0, N = T->getVlen(); I < N; ++I)
-    H = hash_combine(H, Vars[I].Offset, Vars[I].Size);
+    H = hash_combine(H, Vars[I].Type, Vars[I].Offset, Vars[I].Size);
   return H;
+}
+
+uint64_t BTFDedupState::hashDeclTag(uint32_t Id) {
+  const BTF::CommonType *T = Builder.findType(Id);
+  if (!T)
+    return 0;
+
+  auto Bytes = Builder.getTypeBytes(Id);
+  if (Bytes.size() < sizeof(BTF::CommonType) + 4)
+    return hashCommon(T);
+
+  uint32_t ComponentIdx = 0;
+  memcpy(&ComponentIdx, Bytes.data() + sizeof(BTF::CommonType), 4);
+  return hash_combine(hashCommon(T), ComponentIdx);
 }
 
 uint64_t BTFDedupState::hashType(uint32_t Id) {
@@ -228,12 +274,23 @@ uint64_t BTFDedupState::hashType(uint32_t Id) {
   case BTF::BTF_KIND_STRUCT:
   case BTF::BTF_KIND_UNION:
     return hashStruct(T);
+  case BTF::BTF_KIND_PTR:
+  case BTF::BTF_KIND_TYPEDEF:
+  case BTF::BTF_KIND_VOLATILE:
+  case BTF::BTF_KIND_CONST:
+  case BTF::BTF_KIND_RESTRICT:
+  case BTF::BTF_KIND_FUNC:
+  case BTF::BTF_KIND_VAR:
+  case BTF::BTF_KIND_TYPE_TAG:
+    return hashCommon(T);
   case BTF::BTF_KIND_FUNC_PROTO:
     return hashFuncProto(T);
   case BTF::BTF_KIND_ARRAY:
     return hashArray(T);
   case BTF::BTF_KIND_DATASEC:
     return hashDataSec(T);
+  case BTF::BTF_KIND_DECL_TAG:
+    return hashDeclTag(Id);
   default:
     // Reference types: hash by kind only (real comparison uses resolved refs).
     return hash_combine(T->getKind());
@@ -390,20 +447,29 @@ bool BTFDedupState::isEquiv(uint32_t CandId, uint32_t CanonId) {
   if (CandId == CanonId)
     return true;
 
+  const BTF::CommonType *Cand = Builder.findType(CandId);
+  const BTF::CommonType *Canon = Builder.findType(CanonId);
+  if (!Cand || !Canon)
+    return false;
+
+  if (Cand->getKind() != Canon->getKind()) {
+    if (isFwdCompatibleWithComposite(Cand, Canon)) {
+      PendingFwdResolutions.push_back({CandId, CanonId});
+      return true;
+    }
+    if (isFwdCompatibleWithComposite(Canon, Cand)) {
+      PendingFwdResolutions.push_back({CanonId, CandId});
+      return true;
+    }
+    return false;
+  }
+
   // Cycle detection: check if we already have a hypothesis for CandId.
   if (HypotMap[CandId] != BTF_UNPROCESSED)
     return HypotMap[CandId] == CanonId;
 
   HypotMap[CandId] = CanonId;
   HypotList.push_back(CandId);
-
-  const BTF::CommonType *Cand = Builder.findType(CandId);
-  const BTF::CommonType *Canon = Builder.findType(CanonId);
-  if (!Cand || !Canon)
-    return false;
-
-  if (Cand->getKind() != Canon->getKind())
-    return false;
 
   switch (Cand->getKind()) {
   case BTF::BTF_KIND_INT:
@@ -570,6 +636,9 @@ Error BTFDedupState::dedupPrimitives() {
 Error BTFDedupState::dedupComposites() {
   uint32_t N = Builder.typesCount();
   for (uint32_t Id = 1; Id <= N; ++Id) {
+    if (Map[Id] != Id)
+      continue;
+
     const BTF::CommonType *T = Builder.findType(Id);
     if (!T || !isCompositeKind(T->getKind()))
       continue;
@@ -579,11 +648,16 @@ Error BTFDedupState::dedupComposites() {
 
     bool Found = false;
     for (uint32_t CanonId : Bucket) {
+      if (CanonId == Id)
+        continue;
+
       clearHypot();
       if (isEquiv(Id, CanonId)) {
         // Commit hypothetical mappings.
         for (uint32_t HId : HypotList)
           Map[HId] = HypotMap[HId];
+        for (const auto &[FwdId, CompositeId] : PendingFwdResolutions)
+          Map[FwdId] = CompositeId;
         Found = true;
         break;
       }
@@ -598,10 +672,11 @@ Error BTFDedupState::dedupComposites() {
 }
 
 //===----------------------------------------------------------------------===//
-// Pass 3: Reference type dedup
+// Pass 4: Resolve unambiguous forward declarations
 //===----------------------------------------------------------------------===//
 
-Error BTFDedupState::dedupRefs() {
+Error BTFDedupState::resolveFwds() {
+  DenseMap<uint32_t, uint32_t> UniqueCompositesByName;
   uint32_t N = Builder.typesCount();
 
   for (uint32_t Id = 1; Id <= N; ++Id) {
@@ -609,32 +684,167 @@ Error BTFDedupState::dedupRefs() {
       continue;
 
     const BTF::CommonType *T = Builder.findType(Id);
+    if (!T || !isCompositeKind(T->getKind()))
+      continue;
+
+    uint32_t NameOff = dedupStrOff(T->NameOff);
+    auto [It, Inserted] = UniqueCompositesByName.try_emplace(NameOff, Id);
+    if (!Inserted)
+      It->second = 0;
+  }
+
+  for (uint32_t Id = 1; Id <= N; ++Id) {
+    if (Map[Id] != Id)
+      continue;
+
+    const BTF::CommonType *T = Builder.findType(Id);
+    if (!T || T->getKind() != BTF::BTF_KIND_FWD)
+      continue;
+
+    auto It = UniqueCompositesByName.find(dedupStrOff(T->NameOff));
+    if (It == UniqueCompositesByName.end() || It->second == 0)
+      continue;
+
+    const BTF::CommonType *Composite = Builder.findType(It->second);
+    if (!isFwdCompatibleWithComposite(T, Composite))
+      continue;
+
+    Map[Id] = It->second;
+  }
+
+  return Error::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Pass 3: Reference type dedup
+//===----------------------------------------------------------------------===//
+
+Error BTFDedupState::dedupRefs() {
+  uint32_t N = Builder.typesCount();
+  RefState.assign(N + 1, RefDedupState::Unprocessed);
+
+  for (uint32_t Id = 1; Id <= N; ++Id) {
+    const BTF::CommonType *T = Builder.findType(Id);
     if (!T)
       continue;
 
     uint32_t Kind = T->getKind();
     if (isPrimitiveKind(Kind) || isCompositeKind(Kind))
       continue;
-
-    uint64_t H = hashType(Id);
-    auto &Bucket = HashBuckets[H];
-
-    bool Found = false;
-    for (uint32_t CanonId : Bucket) {
-      clearHypot();
-      if (isEquiv(Id, CanonId)) {
-        Map[Id] = CanonId;
-        Found = true;
-        break;
-      }
-    }
-
-    clearHypot();
-    if (!Found)
-      Bucket.push_back(Id);
+    if (Error E = dedupRefType(Id).takeError())
+      return E;
   }
 
   return Error::success();
+}
+
+Expected<uint32_t> BTFDedupState::dedupRefType(uint32_t Id) {
+  Id = resolve(Id);
+  if (Id == 0)
+    return 0u;
+
+  const BTF::CommonType *T = Builder.findType(Id);
+  if (!T)
+    return createStringError(inconvertibleErrorCode(),
+                             "invalid BTF type id %u", Id);
+
+  uint32_t Kind = T->getKind();
+  if (isPrimitiveKind(Kind) || isCompositeKind(Kind))
+    return Id;
+
+  if (RefState[Id] == RefDedupState::Done)
+    return Id;
+  if (RefState[Id] == RefDedupState::InProgress)
+    return createStringError(inconvertibleErrorCode(),
+                             "cycle detected in BTF reference dedup at type %u",
+                             Id);
+
+  RefState[Id] = RefDedupState::InProgress;
+
+  auto Fail = [&](Error E) -> Expected<uint32_t> {
+    RefState[Id] = RefDedupState::Unprocessed;
+    return std::move(E);
+  };
+
+  MutableArrayRef<uint8_t> Bytes = Builder.getMutableTypeBytes(Id);
+  if (Bytes.size() < sizeof(BTF::CommonType))
+    return Fail(createStringError(inconvertibleErrorCode(),
+                                  "truncated BTF type record %u", Id));
+
+  auto *MutT = reinterpret_cast<BTF::CommonType *>(Bytes.data());
+  uint8_t *TailPtr = Bytes.data() + sizeof(BTF::CommonType);
+
+  auto DedupTypeRef = [&](uint32_t &TypeRef) -> Error {
+    if (TypeRef == 0)
+      return Error::success();
+    Expected<uint32_t> NewType = dedupRefType(TypeRef);
+    if (!NewType)
+      return NewType.takeError();
+    TypeRef = *NewType;
+    return Error::success();
+  };
+
+  switch (Kind) {
+  case BTF::BTF_KIND_PTR:
+  case BTF::BTF_KIND_TYPEDEF:
+  case BTF::BTF_KIND_VOLATILE:
+  case BTF::BTF_KIND_CONST:
+  case BTF::BTF_KIND_RESTRICT:
+  case BTF::BTF_KIND_FUNC:
+  case BTF::BTF_KIND_VAR:
+  case BTF::BTF_KIND_DECL_TAG:
+  case BTF::BTF_KIND_TYPE_TAG:
+    if (Error E = DedupTypeRef(MutT->Type))
+      return Fail(std::move(E));
+    break;
+  case BTF::BTF_KIND_ARRAY: {
+    auto *Arr = reinterpret_cast<BTF::BTFArray *>(TailPtr);
+    if (Error E = DedupTypeRef(Arr->ElemType))
+      return Fail(std::move(E));
+    if (Error E = DedupTypeRef(Arr->IndexType))
+      return Fail(std::move(E));
+    break;
+  }
+  case BTF::BTF_KIND_FUNC_PROTO: {
+    auto *Params = reinterpret_cast<BTF::BTFParam *>(TailPtr);
+    if (Error E = DedupTypeRef(MutT->Type))
+      return Fail(std::move(E));
+    for (unsigned I = 0, N = MutT->getVlen(); I < N; ++I)
+      if (Error E = DedupTypeRef(Params[I].Type))
+        return Fail(std::move(E));
+    break;
+  }
+  case BTF::BTF_KIND_DATASEC: {
+    auto *Vars = reinterpret_cast<BTF::BTFDataSec *>(TailPtr);
+    for (unsigned I = 0, N = MutT->getVlen(); I < N; ++I)
+      if (Error E = DedupTypeRef(Vars[I].Type))
+        return Fail(std::move(E));
+    break;
+  }
+  default:
+    RefState[Id] = RefDedupState::Done;
+    return Id;
+  }
+
+  uint64_t H = hashType(Id);
+  auto &Bucket = HashBuckets[H];
+
+  uint32_t CanonId = Id;
+  for (uint32_t CandidateId : Bucket) {
+    clearHypot();
+    if (isEquiv(Id, CandidateId)) {
+      CanonId = CandidateId;
+      break;
+    }
+  }
+
+  clearHypot();
+  Map[Id] = CanonId;
+  if (CanonId == Id)
+    Bucket.push_back(Id);
+
+  RefState[Id] = RefDedupState::Done;
+  return CanonId;
 }
 
 //===----------------------------------------------------------------------===//
@@ -796,6 +1006,8 @@ Error BTFDedupState::run() {
   if (Error E = dedupPrimitives())
     return E;
   if (Error E = dedupComposites())
+    return E;
+  if (Error E = resolveFwds())
     return E;
   if (Error E = dedupRefs())
     return E;
